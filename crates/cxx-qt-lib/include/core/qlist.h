@@ -13,6 +13,8 @@
 #include <QtCore/QByteArray>
 #include <QtCore/QDate>
 #include <QtCore/QDateTime>
+#include <QtCore/QLine>
+#include <QtCore/QLineF>
 #include <QtCore/QMargins>
 #include <QtCore/QMarginsF>
 #include <QtCore/QPersistentModelIndex>
@@ -155,6 +157,8 @@ using QList_QColor = QList<::QColor>;
 #endif
 using QList_QDate = QList<::QDate>;
 using QList_QDateTime = QList<::QDateTime>;
+using QList_QLine = QList<::QLine>;
+using QList_QLineF = QList<::QLineF>;
 using QList_QMargins = QList<::QMargins>;
 using QList_QMarginsF = QList<::QMarginsF>;
 using QList_QPersistentModelIndex = QList<::QPersistentModelIndex>;

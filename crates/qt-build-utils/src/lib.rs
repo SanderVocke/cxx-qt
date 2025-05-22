@@ -45,7 +45,22 @@ pub enum QtBuildError {
     QtMissing,
     /// Executing `qmake -query` failed
     #[error("Executing `qmake -query` failed: {0:?}")]
-    QmakeFailed(#[from] std::io::Error),
+    RunQmakeFailed(#[from] std::io::Error),
+    /// qmake returned non-zero
+    #[error("`qmake -query` returned nonzero: {stdout}")]
+    QmakeFailed {
+        /// The decoded stdout of the command
+        stdout : String
+    },
+    /// decoding qmake output failed
+    #[error("Decoding `qmake -query` output failed: {0:?}")]
+    DecodeQmakeOutputFailed(#[from] core::str::Utf8Error),
+    /// Parsing qmake output failed
+    #[error("Parsing `qmake -query` output failed: {stdout}")]
+    ParseQmakeOutputFailed {
+        /// The decoded stdout of the command
+        stdout : String
+    },
     /// `QT_VERSION_MAJOR` environment variable was specified but could not be parsed as an integer
     #[error("QT_VERSION_MAJOR environment variable specified as {qt_version_major_env_var} but could not parse as integer: {source:?}")]
     QtVersionMajorInvalid {
@@ -73,6 +88,18 @@ fn is_apple_target() -> bool {
     env::var("TARGET")
         .map(|target| target.contains("apple"))
         .unwrap_or_else(|_| false)
+}
+
+/// Whether windows is the current target
+fn is_windows_target() -> bool {
+    env::var("TARGET")
+        .map(|target| target.contains("windows"))
+        .unwrap_or_else(|_| false)
+}
+
+/// Whether windows is the current host
+fn is_windows_host() -> bool {
+    cfg!(target_os = "windows")
 }
 
 /// Linking executables (including tests) with Cargo that link to Qt fails to link with GNU ld.bfd,
@@ -282,48 +309,38 @@ impl QtBuild {
         println!("cargo::rerun-if-env-changed=QMAKE");
         println!("cargo::rerun-if-env-changed=QT_VERSION_MAJOR");
         fn verify_candidate(candidate: &str) -> Result<(&str, versions::SemVer), QtBuildError> {
-            match Command::new(candidate)
-                .args(["-query", "QT_VERSION"])
-                .output()
+            match QtBuild::qmake_query_explicit(candidate, "QT_VERSION")
             {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(QtBuildError::QtMissing),
-                Err(e) => Err(QtBuildError::QmakeFailed(e)),
-                Ok(output) => {
-                    if output.status.success() {
-                        let version_string = std::str::from_utf8(&output.stdout)
-                            .unwrap()
-                            .trim()
-                            .to_string();
-                        let qmake_version = versions::SemVer::new(version_string).unwrap();
-                        if let Ok(env_version) = env::var("QT_VERSION_MAJOR") {
-                            let env_version = match env_version.trim().parse::<u32>() {
-                                Err(e) if *e.kind() == std::num::IntErrorKind::Empty => {
-                                    println!(
-                                        "cargo::warning=QT_VERSION_MAJOR environment variable defined but empty"
-                                    );
-                                    return Ok((candidate, qmake_version));
-                                }
-                                Err(e) => {
-                                    return Err(QtBuildError::QtVersionMajorInvalid {
-                                        qt_version_major_env_var: env_version,
-                                        source: e,
-                                    })
-                                }
-                                Ok(int) => int,
-                            };
-                            if env_version == qmake_version.major {
+                Err(e) => Err(e),
+                Ok(version_string) => {
+                    let qmake_version = versions::SemVer::new(&version_string)
+                       .ok_or(QtBuildError::ParseQmakeOutputFailed { stdout: version_string })?;
+                    if let Ok(env_version) = env::var("QT_VERSION_MAJOR") {
+                        let env_version = match env_version.trim().parse::<u32>() {
+                            Err(e) if *e.kind() == std::num::IntErrorKind::Empty => {
+                                println!(
+                                    "cargo::warning=QT_VERSION_MAJOR environment variable defined but empty"
+                                );
                                 return Ok((candidate, qmake_version));
-                            } else {
-                                return Err(QtBuildError::QtVersionMajorDoesNotMatch {
-                                    qmake_version: qmake_version.major,
-                                    qt_version_major: env_version,
-                                });
                             }
+                            Err(e) => {
+                                return Err(QtBuildError::QtVersionMajorInvalid {
+                                    qt_version_major_env_var: env_version,
+                                    source: e,
+                                })
+                            }
+                            Ok(int) => int,
+                        };
+                        if env_version == qmake_version.major {
+                            return Ok((candidate, qmake_version));
+                        } else {
+                            return Err(QtBuildError::QtVersionMajorDoesNotMatch {
+                                qmake_version: qmake_version.major,
+                                qt_version_major: env_version,
+                            });
                         }
-                        Ok((candidate, qmake_version))
-                    } else {
-                        Err(QtBuildError::QtMissing)
                     }
+                    Ok((candidate, qmake_version))
                 }
             }
         }
@@ -390,18 +407,42 @@ impl QtBuild {
         Err(QtBuildError::QtMissing)
     }
 
-    /// Get the output of running `qmake -query var_name`
+    /// Attempt to get the output of running `qmake -query var_name`.
+    pub fn qmake_query_explicit(qmake_executable: &str,
+                                var_name: &str) -> Result<String, QtBuildError> {
+        let shell_command = format!("{} -query {}", qmake_executable, var_name);
+        let command_output =
+            if is_windows_host() {
+                Command::new("cmd").args(["/C", &shell_command]).output()
+            } else {
+                Command::new("sh").args(["-c", &shell_command]).output()
+            };
+
+        match command_output {
+            Ok(output) => {
+                let output_string : String;
+                match std::str::from_utf8(&output.stdout)
+                {
+                    Ok(s) => { output_string = s.trim().to_string() },
+                    Err(e) => { return Err(QtBuildError::DecodeQmakeOutputFailed(e)); }
+                }
+                if !output.status.success() {
+                    return Err(QtBuildError::QmakeFailed { stdout: output_string });
+                } else if output.stdout.is_empty() {
+                    return Err(QtBuildError::ParseQmakeOutputFailed { stdout: "".to_string() });
+                }
+                Ok(output_string)
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(QtBuildError::QtMissing),
+            Err(e) => Err(QtBuildError::RunQmakeFailed(e)),
+        }
+    }
+
+    /// Query the qmake executable which was previously
+    /// verified. Panic on error.
     pub fn qmake_query(&self, var_name: &str) -> String {
-        std::str::from_utf8(
-            &Command::new(&self.qmake_executable)
-                .args(["-query", var_name])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string()
+        Self::qmake_query_explicit(&self.qmake_executable, var_name)
+            .unwrap()
     }
 
     fn cargo_link_qt_library(
@@ -439,7 +480,8 @@ impl QtBuild {
     }
 
     /// Some prl files include their architecture in their naming scheme.
-    /// Just try all known architectures and fallback to non when they all failed.
+    /// Some have debug suffixes (Windows).
+    /// Just try all known architectures and fallback to non if they all failed.
     fn find_qt_module_prl(
         &self,
         lib_path: &str,
@@ -447,30 +489,43 @@ impl QtBuild {
         version_major: u32,
         qt_module: &str,
     ) -> String {
-        for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
-            let prl_path = format!(
-                "{}/{}Qt{}{}{}.prl",
-                lib_path, prefix, version_major, qt_module, arch
-            );
-            match Path::new(&prl_path).try_exists() {
-                Ok(exists) => {
-                    if exists {
-                        return prl_path;
+        let try_find = | suffix : &'static str | -> String {
+            for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
+                let prl_path = format!(
+                    "{}/{}Qt{}{}{}{}.prl",
+                    lib_path, prefix, version_major, qt_module, suffix, arch
+                );
+                match Path::new(&prl_path).try_exists() {
+                    Ok(exists) => {
+                        if exists {
+                            return prl_path;
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo::warning=failed checking for existence of {}: {}",
+                            prl_path, e
+                        );
                     }
                 }
-                Err(e) => {
-                    println!(
-                        "cargo::warning=failed checking for existence of {}: {}",
-                        prl_path, e
-                    );
-                }
+            }
+
+            format!(
+                "{}/{}Qt{}{}{}.prl",
+                lib_path, prefix, version_major, qt_module, suffix
+            )
+        };
+
+        let candidate = try_find("");
+        if is_windows_target() && !Path::new(&candidate).exists() {
+            // On Windows, if dealing with a debug build of Qt, there will be "d"
+            // suffixes to the prl's.
+            let debug_candidate = try_find("d");
+            if Path::new(&debug_candidate).exists() {
+                return debug_candidate;
             }
         }
-
-        format!(
-            "{}/{}Qt{}{}.prl",
-            lib_path, prefix, version_major, qt_module
-        )
+        candidate
     }
 
     /// Tell Cargo to link each Qt module.
@@ -530,10 +585,13 @@ impl QtBuild {
                     format!("{lib_path}/Qt{qt_module}.framework/Resources/Qt{qt_module}.prl"),
                 )
             } else {
-                (
-                    format!("Qt{}{qt_module}", self.version.major),
-                    self.find_qt_module_prl(&lib_path, prefix, self.version.major, qt_module),
-                )
+                /// Choose the regular module library name, or if a Windows debug prl was found
+                /// (d suffix), the matching library
+                let prl = self.find_qt_module_prl(&lib_path, prefix, self.version.major, qt_module);
+                let lib = if is_windows_target() && prl.contains(&format!("{qt_module}d"))
+                    { format!("Qt{}{qt_module}d", self.version.major) }
+                    else { format!("Qt{}{qt_module}", self.version.major)  };
+                (lib, prl)
             };
 
             self.cargo_link_qt_library(

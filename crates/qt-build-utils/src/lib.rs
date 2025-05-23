@@ -90,6 +90,13 @@ fn is_apple_target() -> bool {
         .unwrap_or_else(|_| false)
 }
 
+/// Whether windows is the current target
+fn is_windows_target() -> bool {
+    env::var("TARGET")
+        .map(|target| target.contains("windows"))
+        .unwrap_or_else(|_| false)
+}
+
 /// Whether windows is the current host
 fn is_windows_host() -> bool {
     cfg!(target_os = "windows")
@@ -480,6 +487,7 @@ impl QtBuild {
     }
 
     /// Some prl files include their architecture in their naming scheme.
+    /// Some have debug suffixes (Windows).
     /// Just try all known architectures and fallback to non if they all failed.
     fn find_qt_module_prl(
         &self,
@@ -488,30 +496,43 @@ impl QtBuild {
         version_major: u32,
         qt_module: &str,
     ) -> String {
-        for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
-            let prl_path = format!(
-                "{}/{}Qt{}{}{}.prl",
-                lib_path, prefix, version_major, qt_module, arch
-            );
-            match Path::new(&prl_path).try_exists() {
-                Ok(exists) => {
-                    if exists {
-                        return prl_path;
+        let try_find = |suffix: &'static str| -> String {
+            for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
+                let prl_path = format!(
+                    "{}/{}Qt{}{}{}{}.prl",
+                    lib_path, prefix, version_major, qt_module, suffix, arch
+                );
+                match Path::new(&prl_path).try_exists() {
+                    Ok(exists) => {
+                        if exists {
+                            return prl_path;
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo::warning=failed checking for existence of {}: {}",
+                            prl_path, e
+                        );
                     }
                 }
-                Err(e) => {
-                    println!(
-                        "cargo::warning=failed checking for existence of {}: {}",
-                        prl_path, e
-                    );
-                }
+            }
+
+            format!(
+                "{}/{}Qt{}{}{}.prl",
+                lib_path, prefix, version_major, qt_module, suffix
+            )
+        };
+
+        let candidate = try_find("");
+        if is_windows_target() && !Path::new(&candidate).exists() {
+            // On Windows, if dealing with a debug build of Qt, there will be "d"
+            // suffixes to the prl's.
+            let debug_candidate = try_find("d");
+            if Path::new(&debug_candidate).exists() {
+                return debug_candidate;
             }
         }
-
-        format!(
-            "{}/{}Qt{}{}.prl",
-            lib_path, prefix, version_major, qt_module
-        )
+        candidate
     }
 
     /// Tell Cargo to link each Qt module.
@@ -571,10 +592,15 @@ impl QtBuild {
                     format!("{lib_path}/Qt{qt_module}.framework/Resources/Qt{qt_module}.prl"),
                 )
             } else {
-                (
-                    format!("Qt{}{qt_module}", self.version.major),
-                    self.find_qt_module_prl(&lib_path, prefix, self.version.major, qt_module),
-                )
+                // Choose the regular module library name, or if a Windows debug prl was found
+                // (d suffix), the matching library
+                let prl = self.find_qt_module_prl(&lib_path, prefix, self.version.major, qt_module);
+                let lib = if is_windows_target() && prl.contains(&format!("{qt_module}d")) {
+                    format!("Qt{}{qt_module}d", self.version.major)
+                } else {
+                    format!("Qt{}{qt_module}", self.version.major)
+                };
+                (lib, prl)
             };
 
             self.cargo_link_qt_library(

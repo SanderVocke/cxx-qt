@@ -50,7 +50,7 @@ pub enum QtBuildError {
     #[error("`qmake -query` returned nonzero: {stdout}")]
     QmakeFailed {
         /// The decoded stdout of the command
-        stdout : String
+        stdout: String,
     },
     /// decoding qmake output failed
     #[error("Decoding `qmake -query` output failed: {0:?}")]
@@ -59,7 +59,7 @@ pub enum QtBuildError {
     #[error("Parsing `qmake -query` output failed: {stdout}")]
     ParseQmakeOutputFailed {
         /// The decoded stdout of the command
-        stdout : String
+        stdout: String,
     },
     /// `QT_VERSION_MAJOR` environment variable was specified but could not be parsed as an integer
     #[error("QT_VERSION_MAJOR environment variable specified as {qt_version_major_env_var} but could not parse as integer: {source:?}")]
@@ -302,12 +302,14 @@ impl QtBuild {
         println!("cargo::rerun-if-env-changed=QMAKE");
         println!("cargo::rerun-if-env-changed=QT_VERSION_MAJOR");
         fn verify_candidate(candidate: &str) -> Result<(&str, versions::SemVer), QtBuildError> {
-            match QtBuild::qmake_query_explicit(candidate, "QT_VERSION")
-            {
+            match QtBuild::qmake_query_explicit(candidate, "QT_VERSION") {
                 Err(e) => Err(e),
                 Ok(version_string) => {
-                    let qmake_version = versions::SemVer::new(&version_string)
-                       .ok_or(QtBuildError::ParseQmakeOutputFailed { stdout: version_string })?;
+                    let qmake_version = versions::SemVer::new(&version_string).ok_or(
+                        QtBuildError::ParseQmakeOutputFailed {
+                            stdout: version_string,
+                        },
+                    )?;
                     if let Ok(env_version) = env::var("QT_VERSION_MAJOR") {
                         let env_version = match env_version.trim().parse::<u32>() {
                             Err(e) if *e.kind() == std::num::IntErrorKind::Empty => {
@@ -401,31 +403,37 @@ impl QtBuild {
     }
 
     /// Attempt to get the output of running `qmake -query var_name`.
-    pub fn qmake_query_explicit(qmake_executable: &str,
-                                var_name: &str) -> Result<String, QtBuildError> {
+    pub fn qmake_query_explicit(
+        qmake_executable: &str,
+        var_name: &str,
+    ) -> Result<String, QtBuildError> {
         let shell_command = format!("{} -query {}", qmake_executable, var_name);
-        let command_output =
-            if is_windows_host() {
-                Command::new("cmd").args(["/C", &shell_command]).output()
-            } else {
-                Command::new("sh").args(["-c", &shell_command]).output()
-            };
+        let command_output = if is_windows_host() {
+            Command::new("cmd").args(["/C", &shell_command]).output()
+        } else {
+            Command::new("sh").args(["-c", &shell_command]).output()
+        };
 
         match command_output {
             Ok(output) => {
-                let output_string : String;
-                match std::str::from_utf8(&output.stdout)
-                {
-                    Ok(s) => { output_string = s.trim().to_string() },
-                    Err(e) => { return Err(QtBuildError::DecodeQmakeOutputFailed(e)); }
+                let output_string: String;
+                match std::str::from_utf8(&output.stdout) {
+                    Ok(s) => output_string = s.trim().to_string(),
+                    Err(e) => {
+                        return Err(QtBuildError::DecodeQmakeOutputFailed(e));
+                    }
                 }
                 if !output.status.success() {
-                    return Err(QtBuildError::QmakeFailed { stdout: output_string });
+                    return Err(QtBuildError::QmakeFailed {
+                        stdout: output_string,
+                    });
                 } else if output.stdout.is_empty() {
-                    return Err(QtBuildError::ParseQmakeOutputFailed { stdout: "".to_string() });
+                    return Err(QtBuildError::ParseQmakeOutputFailed {
+                        stdout: "".to_string(),
+                    });
                 }
                 Ok(output_string)
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(QtBuildError::QtMissing),
             Err(e) => Err(QtBuildError::RunQmakeFailed(e)),
         }
@@ -434,8 +442,7 @@ impl QtBuild {
     /// Query the qmake executable which was previously
     /// verified. Panic on error.
     pub fn qmake_query(&self, var_name: &str) -> String {
-        Self::qmake_query_explicit(&self.qmake_executable, var_name)
-            .unwrap()
+        Self::qmake_query_explicit(&self.qmake_executable, var_name).unwrap()
     }
 
     fn cargo_link_qt_library(

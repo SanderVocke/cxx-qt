@@ -251,10 +251,18 @@ impl QtInstallation for QtInstallationQMake {
                     format!("{lib_path}/Qt{qt_module}.framework/Resources/Qt{qt_module}.prl"),
                 )
             } else {
-                (
-                    format!("Qt{}{qt_module}", self.qmake_version.major),
-                    self.find_qt_module_prl(&lib_path, prefix, self.qmake_version.major, qt_module),
-                )
+                let prl =
+                    self.find_qt_module_prl(&lib_path, prefix, self.qmake_version.major, &qt_module);
+                // On Windows, if the prl path contains the "d" suffix, link against
+                // the debug Qt library (e.g. Qt6Testd instead of Qt6Test).
+                let lib = if target.as_ref().map(|t| t.contains("windows")).unwrap_or(false)
+                    && prl.contains(&format!("{qt_module}d.prl"))
+                {
+                    format!("Qt{}{qt_module}d", self.qmake_version.major)
+                } else {
+                    format!("Qt{}{qt_module}", self.qmake_version.major)
+                };
+                (lib, prl)
             };
 
             self.link_qt_library(
@@ -311,21 +319,39 @@ impl QtInstallationQMake {
         version_major: u64,
         qt_module: &str,
     ) -> String {
-        for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
-            let prl_path = format!("{lib_path}/{prefix}Qt{version_major}{qt_module}{arch}.prl");
-            match Path::new(&prl_path).try_exists() {
-                Ok(exists) => {
-                    if exists {
-                        return prl_path;
+        let is_windows = env::var("TARGET")
+            .as_ref()
+            .map(|t| t.contains("windows"))
+            .unwrap_or(false);
+
+        let try_find = |suffix: &str| -> String {
+            for arch in ["", "_arm64-v8a", "_armeabi-v7a", "_x86", "_x86_64"] {
+                let prl_path =
+                    format!("{lib_path}/{prefix}Qt{version_major}{qt_module}{suffix}{arch}.prl");
+                match Path::new(&prl_path).try_exists() {
+                    Ok(exists) => {
+                        if exists {
+                            return prl_path;
+                        }
+                    }
+                    Err(e) => {
+                        println!("cargo::warning=failed checking for existence of {prl_path}: {e}");
                     }
                 }
-                Err(e) => {
-                    println!("cargo::warning=failed checking for existence of {prl_path}: {e}");
-                }
+            }
+            format!("{lib_path}/{prefix}Qt{version_major}{qt_module}{suffix}.prl")
+        };
+
+        let candidate = try_find("");
+        if is_windows && !Path::new(&candidate).exists() {
+            // On Windows, vcpkg debug builds of Qt use a "d" suffix on library
+            // and .prl filenames (e.g. Qt6Testd.lib, Qt6Testd.prl).
+            let debug_candidate = try_find("d");
+            if Path::new(&debug_candidate).exists() {
+                return debug_candidate;
             }
         }
-
-        format!("{lib_path}/{prefix}Qt{version_major}{qt_module}.prl")
+        candidate
     }
 
     fn link_qt_library(
